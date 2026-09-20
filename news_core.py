@@ -1,8 +1,9 @@
-# Shared core for instant pipeline: fetch -> categorize -> score -> viral pack.
-# $0, no LLM, template-based. Used by bot.py (digest) and tbot.py (interactive).
+# news_core.py — Best-of-best engine for instant pipeline.
+# $0, no LLM. Engagement signals + emotion scoring + per-category quotas.
+# Laptop closed = GitHub Actions runs this. Used by bot.py, tbot.py, responder.py.
 import re
 import html
-import json
+import math
 import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
@@ -15,31 +16,52 @@ socket.setdefaulttimeout(15)
 try:
     from sources import SOURCES, MAX_PER_RUN, KEYWORDS
 except ImportError:
-    SOURCES, MAX_PER_RUN, KEYWORDS = [], 12, []
+    SOURCES, MAX_PER_RUN, KEYWORDS = [], 9, []
 
-# Handles locked direction (user gave base, we use daily variants for uniformity).
-# Change here once finalized: must be same on IG/TikTok/Shorts.
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) ai-news-bot/1.0"}
+
 HANDLES = {
-    "business": "@founderfilesdaily",       # base: @founderfiles (taken)
-    "entertainment": "@viralvaultdaily",    # base: @viralvault (taken/crowded)
-    "ai": "@botbriefdaily",                 # base: @botbrief (IG free, YT/X taken)
+    "business": "@founderfilesdaily",
+    "entertainment": "@viralvaultdaily",
+    "ai": "@botbriefdaily",
 }
 PAGE_NAMES = {
     "business": "FounderFiles | Business",
     "entertainment": "ViralVault | Entertainment",
     "ai": "BotBrief | AI",
 }
-PAGE_EMOJI = {"business": "\U0001f4bc", "entertainment": "\U0001f3ac", "ai": "\U0001f916"}
+PAGE_EMOJI = {"business": "💼", "entertainment": "🎬", "ai": "🤖"}
 
-BIZ_KW = ["launch", "startup", "founder", "funding", "raises", "raised", "seed",
-          "series a", "ipo", "acqui", "startup", "business", "revenue", "profit",
-          "unicorn", "yc ", "y combinator", "product hunt", "just launched"]
-ENT_KW = ["viral", "streamer", "live", "twitch", "kick", "ishowspeed", "kaicenat",
-          "celeb", "kardashian", "taylor swift", "mrbeast", "funny", "fail",
-          "cctv", "caught on camera", "fight", "drama", "meme", "tiktok"]
-AI_KW = ["ai", "llm", "gpt", "claude", "gemini", "agent", "openai", "anthropic",
-         "diffusion", "transformer", "copilot", "midjourney", "llama", "mistral",
-         "sora", "sun o", "robot"]
+# ---- hard filters: these NEVER reach the pages (advertiser-safe, no junk) ----
+BLOCK = ["trump", "biden", "white house", "senate", "congress", "election",
+         "democrat", "republican", "putin", "gaza", "ukraine war", "parliament",
+         "minister ", " fundamentally", "arxiv", "[paper]",
+         "ticket", "prices go up", "disrupt ", "webinar", "sponsored",
+         "register now", "early bird", "use code ", "we're hiring",
+         "join our team", "blueprint", "whitepaper", "framework paper"]
+
+BIZ_KW = ["launch", "launches", "startup", "startups", "founder", "founders",
+          "funding", "raises", "raised", "seed", "series a", "series b", "ipo",
+          "acqui", "revenue", "profit", "unicorn", "y combinator",
+          "product hunt", "just launched", "business", "billion",
+          "million users", "shut down", "layoff"]
+ENT_KW = ["viral", "streamer", "streamers", "twitch", "kick", "ishowspeed",
+          "kaicenat", "celeb", "celebrity", "celebrities", "mrbeast", "funny",
+          "fail", "fails", "cctv", "caught on camera", "fight", "drama",
+          "meme", "memes", "tiktok", "satisfying", "insane", "reaction",
+          "prank", "freakout", "audition", "proposal", "wedding", "rescue"]
+AI_KW = ["ai", "llm", "gpt", "claude", "gemini", "agent", "agents", "openai",
+         "anthropic", "diffusion", "transformer", "copilot", "midjourney",
+         "llama", "mistral", "sora", "robot", "robots", "open-source model",
+         "beats gpt", "beats claude"]
+
+# curiosity/emotion triggers: people click + feel something
+EMOTION = ["just", "first", "broke", "breaks", "insane", "viral", "exposed",
+           "secret", "leaked", "banned", "shut", "vs ", "wins", "fails",
+           "reaction", "caught", "live", "million", "billion", "free",
+           "mind-blow", "genius", "scam", "plot twist", "turns into",
+           "quits", "fired", "record", "youngest", "oldest", "never seen",
+           "satisfying", "transformation", "proposal", "rescue", "chase"]
 
 
 def clean(text, n=300):
@@ -49,221 +71,300 @@ def clean(text, n=300):
     return html.unescape(text).strip()[:n]
 
 
+def blocked(title, summary=""):
+    low = f"{title} {summary}".lower()
+    return any(b in low for b in BLOCK)
+
+
+def _kw(low, phrases):
+    """Word-ish match: 'ai' must not fire inside 'spain', 'celeb' not in 'celebrate'."""
+    n = 0
+    for p in phrases:
+        p = p.strip().lower()
+        if re.search(r"(?<![a-z])" + re.escape(p) + r"(?![a-z])", low):
+            n += 1
+    return n
+
+
 def categorize(title, summary, hint=None):
     low = f"{title} {summary}".lower()
     scores = {
-        "business": sum(1 for k in BIZ_KW if k in low),
-        "entertainment": sum(1 for k in ENT_KW if k in low),
-        "ai": sum(1 for k in AI_KW if k in low),
+        "business": _kw(low, BIZ_KW),
+        "entertainment": _kw(low, ENT_KW),
+        "ai": _kw(low, AI_KW),
     }
-    # hint from source breaks ties
     if hint in scores:
         scores[hint] += 1.5
     best = max(scores, key=lambda k: scores[k])
     if scores[best] == 0:
-        # default routing: tech-y -> ai, else business
-        return "ai"
+        return None  # no signal = not best-of-best = drop it
     return best
 
 
-def score_item(title, source_name, published_parsed):
-    s = 0
-    # source weight: official labs + launches first
-    high = ["openai", "google", "deepmind", "anthropic", "techcrunch startups",
-            "product hunt", "hackernews"]
-    if any(h in source_name.lower() for h in high):
-        s += 3
+def emotion_bonus(title):
     low = title.lower()
-    if any(k in low for k in ["just launched", "breaking", "launches", "raises $", "viral"]):
-        s += 2
-    # de-boost raw politics so pages stay advertiser-safe; fun/launches rank first
-    if any(k in low for k in ["trump", "biden", "election", "white house", "senate", "congress"]):
-        s -= 2
-    if published_parsed:
-        try:
-            dt = datetime(*published_parsed[:6], tzinfo=timezone.utc)
-            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-            if age_h < 2:
-                s += 3
-            elif age_h < 6:
-                s += 2
-            elif age_h < 12:
-                s += 1
-        except Exception:
-            pass
-    return s
+    bonus = sum(1 for e in EMOTION if e in low)
+    if re.search(r"\$\d|\d+m\b|\d+k\b|\d+x\b|\d+-\w+|\?", low):
+        bonus += 1  # numbers / questions = curiosity gap
+    if len(title) > 140:
+        bonus -= 1  # rambling headlines don't hook
+    return bonus
 
 
-def is_recent(published_parsed, max_hours):
-    if not published_parsed:
-        return True
+def engagement_score(eng):
+    # log scale: 10k upvotes >> 100, but diminishing
     try:
-        dt = datetime(*published_parsed[:6], tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - dt < timedelta(hours=max_hours)
+        return math.log10(max(int(eng), 1) + 1)
     except Exception:
-        return True
+        return 0
 
 
-def fetch_all(seen=None, max_age_hours=6, max_per_run=12):
-    seen = seen or set()
-    out = []
-    for src in SOURCES:
-        try:
-            if src.get("type") == "hn":
-                out.extend(_fetch_hn(src, seen, max_age_hours))
-            elif src.get("type") == "arxiv":
-                out.extend(_fetch_arxiv(src, seen))
-            else:
-                out.extend(_fetch_rss(src, seen, max_age_hours))
-        except Exception as ex:
-            print("fetch fail", src.get("name"), ex)
-        time.sleep(0.3)
-    # categorize + score + sort
-    for it in out:
-        it["page"] = categorize(it["title"], it.get("summary", ""), src_hint(it))
-        it["score"] = score_item(it["title"], it["source"], it.get("pp"))
-    out.sort(key=lambda x: (-x.get("score", 0), x.get("title", "")))
-    return out[:max_per_run]
+def rank(item):
+    """Single number: higher = people care + feel something + fresh."""
+    s = 0.0
+    s += engagement_score(item.get("engagement", 0)) * 2.0
+    s += emotion_bonus(item.get("title", "")) * 1.5
+    age_h = item.get("age_hours", 99)
+    if age_h < 3:
+        s += 3
+    elif age_h < 8:
+        s += 2
+    elif age_h < 24:
+        s += 1
+    elif age_h > 36:
+        s -= 2
+    hi = ["openai", "google", "deepmind", "anthropic", "techcrunch",
+          "hackernews", "product hunt"]
+    if any(h in item.get("source", "").lower() for h in hi):
+        s += 1
+    return round(s, 2)
 
 
-def src_hint(item):
-    # recover hint from source name if known
-    s = item.get("source", "").lower()
-    if "startup" in s or "techcrunch" in s:
-        return "business"
-    if "reddit" in s or "verge" in s:
-        return "entertainment"
-    return "ai"
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
-def _fetch_rss(src, seen, max_age_hours):
-    # requests-first (respects timeout) then feedparser on bytes.
-    # feedparser.parse(url) hangs on some 301s (blog.google) — never call it directly.
+# ---------------- fetchers (all fail-fast, never hang) ----------------
+
+def _rss_items(src, max_age_hours):
     items = []
-    feed = None
     try:
-        r = requests.get(src["url"], timeout=12,
-                         headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) ai-news-bot/1.0"})
-        if r.ok and r.content:
-            feed = feedparser.parse(r.content)
+        r = requests.get(src["url"], timeout=12, headers=UA)
+        if not r.ok or not r.content:
+            return []
+        feed = feedparser.parse(r.content)
     except Exception as ex:
-        print("rss http fail", src["name"], str(ex)[:100])
-    if feed is None or not feed.entries:
-        return []  # fail fast, next source. No hanging fallback.
-    for e in feed.entries[:10]:
+        print("rss fail", src["name"], str(ex)[:100])
+        return []
+    for e in feed.entries[:15]:
         link = getattr(e, "link", "")
         title = getattr(e, "title", "").strip()
-        if not link or not title or link in seen:
+        if not link or not title:
+            continue
+        summary = getattr(e, "summary", "") or getattr(e, "description", "")
+        if blocked(title, summary):
             continue
         if src.get("filter"):
-            low = (title + " " + getattr(e, "summary", "")).lower()
+            low = (title + " " + summary).lower()
             if not any(k in low for k in KEYWORDS):
                 continue
         pp = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
-        if not is_recent(pp, max_age_hours):
+        age_h = 99
+        if pp:
+            try:
+                dt = datetime(*pp[:6], tzinfo=timezone.utc)
+                age_h = (now_utc() - dt).total_seconds() / 3600
+            except Exception:
+                pass
+        if age_h > max_age_hours:
             continue
-        summary = getattr(e, "summary", "") or getattr(e, "description", "")
-        items.append({"title": title, "link": link, "source": src["name"],
-                      "summary": clean(summary, 400), "pp": pp})
+        items.append({"title": clean(title, 160), "link": link,
+                      "source": src["name"], "summary": clean(summary, 400),
+                      "engagement": 0, "age_hours": round(age_h, 1)})
     return items
 
 
-def _fetch_hn(src, seen, max_age_hours):
+def _hn_items(src, max_age_hours, min_points=30):
     from email.utils import parsedate_to_datetime
     items = []
     try:
-        r = requests.get(src["url"], timeout=20).json()
-        for h in r.get("hits", [])[:12]:
-            title = h.get("title", "") or ""
-            link = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
-            if link in seen or not title:
-                continue
-            low = title.lower()
-            # launch-type HN passes even without AI kw
-            is_launch = any(k in low for k in ["launch", "show hn", "startup", "funding", "ai"])
-            if not is_launch and not any(k in low for k in KEYWORDS):
-                continue
-            try:
-                ca = h.get("created_at", "")
-                dt = parsedate_to_datetime(ca) if "GMT" in ca else datetime.fromisoformat(ca.replace("Z", "+00:00"))
-                if datetime.now(timezone.utc) - dt > timedelta(hours=max_age_hours):
-                    continue
-            except Exception:
-                pass
-            if h.get("points", 0) < 10:
-                continue
-            items.append({"title": title, "link": link, "source": "HackerNews",
-                          "summary": f"{h.get('points')} points", "pp": None})
+        r = requests.get(src["url"], timeout=12, headers=UA).json()
     except Exception as ex:
-        print("hn fail", ex)
+        print("hn fail", str(ex)[:100])
+        return []
+    for h in r.get("hits", [])[:15]:
+        title = h.get("title", "") or ""
+        link = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+        if not title or blocked(title):
+            continue
+        pts = h.get("points", 0) or 0
+        if pts < min_points:
+            continue
+        try:
+            ca = h.get("created_at", "")
+            dt = (parsedate_to_datetime(ca) if "GMT" in ca
+                  else datetime.fromisoformat(ca.replace("Z", "+00:00")))
+            age_h = (now_utc() - dt).total_seconds() / 3600
+        except Exception:
+            age_h = 99
+        if age_h > max_age_hours:
+            continue
+        items.append({"title": clean(title, 160), "link": link,
+                      "source": "HackerNews",
+                      "summary": f"{pts} points, {h.get('num_comments', 0)} comments",
+                      "engagement": pts + (h.get("num_comments", 0) or 0),
+                      "age_hours": round(age_h, 1)})
     return items
 
 
-def _fetch_arxiv(src, seen):
+REDDIT_SUBS = [
+    ("videos", "entertainment"),
+    ("interestingasfuck", "entertainment"),
+    ("Damnthatsinteresting", "entertainment"),
+    ("memes", "entertainment"),
+]
+
+
+def _reddit_items(max_age_hours=12, min_score=1500):
+    """Reddit hot.json = real crowd votes = people-care signal. $0, no key."""
     items = []
-    try:
-        r = requests.get(src["url"], timeout=20, headers={"User-Agent": "ai-news-bot/1.0"})
-        entries = re.findall(r"<entry>.*?</entry>", r.text, re.DOTALL)[:8]
-        for it in entries:
-            t = re.search(r"<title>(.*?)</title>", it, re.DOTALL)
-            l = re.search(r"<id>(.*?)</id>", it, re.DOTALL)
-            s = re.search(r"<summary>(.*?)</summary>", it, re.DOTALL)
-            if not t or not l:
+    for sub, page in REDDIT_SUBS:
+        try:
+            r = requests.get(f"https://www.reddit.com/r/{sub}/hot.json?limit=25",
+                             timeout=12, headers=UA).json()
+        except Exception as ex:
+            print("reddit fail", sub, str(ex)[:80])
+            continue
+        for c in r.get("data", {}).get("children", []):
+            d = c.get("data", {})
+            title = d.get("title", "") or ""
+            if (not title or d.get("stickied") or d.get("over_18")
+                    or blocked(title)):
                 continue
-            title = re.sub(r"\s+", " ", t.group(1)).strip()
-            link = l.group(1).strip()
-            if link in seen:
+            score = d.get("score", 0) or 0
+            comments = d.get("num_comments", 0) or 0
+            if score < min_score and comments < 150:
+                continue  # crowd didn't care -> skip
+            try:
+                age_h = (now_utc().timestamp() - float(d.get("created_utc", 0))) / 3600
+            except Exception:
+                age_h = 99
+            if age_h > max_age_hours:
                 continue
-            summary = re.sub(r"\s+", " ", s.group(1)).strip() if s else ""
-            items.append({"title": "[Paper] " + title, "link": link,
-                          "source": "arXiv cs.AI", "summary": clean(summary, 400), "pp": None})
-            if len(items) >= 2:
-                break
-    except Exception as ex:
-        print("arxiv fail", ex)
+            items.append({"title": clean(title, 160),
+                          "link": "https://www.reddit.com" + d.get("permalink", ""),
+                          "source": f"Reddit r/{sub}",
+                          "summary": f"{score} upvotes, {comments} comments",
+                          "engagement": score + comments * 3,
+                          "age_hours": round(age_h, 1), "_page": page})
+        time.sleep(0.4)
     return items
 
 
-# ---------- viral pack ----------
+def fetch_categorized(seen=None, per_page=3):
+    """Returns {business:[...], entertainment:[...], ai:[...]} — best of best only."""
+    seen = seen or set()
+    pool = []
+    for src in SOURCES:
+        t = src.get("type")
+        try:
+            if t == "hn":
+                # Show HN / launches: fresher window, lower bar (new things)
+                if "launch" in src.get("name", "").lower() or "show" in src.get("url", "").lower():
+                    pool.extend(_hn_items(src, 36, 15))
+                else:
+                    pool.extend(_hn_items(src, 36, 40))
+            elif t == "arxiv":
+                continue  # papers = filler bank, never instant
+            else:
+                name = src.get("name", "").lower()
+                if "startup" in name or "techcrunch" in name:
+                    pool.extend(_rss_items(src, 36))   # biz moves stay relevant ~1.5d
+                elif ("reddit" in name or "boredpanda" in name or "twisted" in name
+                        or "verge" in name):
+                    pool.extend(_rss_items(src, 18))   # entertainment expires fast
+                else:
+                    pool.extend(_rss_items(src, 30))   # AI news ~1d
+        except Exception as ex:
+            print("fetch fail", src.get("name"), str(ex)[:80])
+        time.sleep(0.2)
+    # entertainment comes from viral RSS pool above (Reddit recency + BoredPanda/TwistedSifter).
+
+    # dedup + seen + rank
+    best = {}
+    for it in pool:
+        if it["link"] in seen or it["link"] in best:
+            continue
+        page = it.pop("_page", None) or categorize(
+            it["title"], it.get("summary", ""), _hint(it))
+        if not page:  # no category signal -> not best-of-best -> drop
+            continue
+        it["page"] = page
+        it["score"] = rank(it)
+        best[it["link"]] = it
+    out = {"business": [], "entertainment": [], "ai": []}
+    for it in best.values():
+        out.get(it["page"], out["ai"]).append(it)
+    for k in out:
+        out[k].sort(key=lambda x: -x["score"])
+        out[k] = out[k][:per_page]
+    return out
+
+
+def _hint(item):
+    s = item.get("source", "").lower()
+    if "launch" in s or "show_hn" in s or "startup" in s or "product" in s:
+        return "business"
+    if "reddit" in s or "boredpanda" in s or "twisted" in s or "verge" in s:
+        return "entertainment"
+    return None  # HN front + blogs: let keywords vote
+
+
+def fetch_all(seen=None, max_age_hours=12, max_per_run=9):
+    """Compat: flat list, interleaved by category so every page is represented."""
+    cats = fetch_categorized(seen=seen, per_page=max(2, max_per_run // 3))
+    flat = []
+    for i in range(max(len(v) for v in cats.values())):
+        for k in ("business", "entertainment", "ai"):
+            if i < len(cats[k]):
+                flat.append(cats[k][i])
+    return flat[:max_per_run]
+
+
+# ---------------- packs + digest ----------------
 
 def short_topic(title):
     t = re.sub(r"^\[Paper\]\s*", "", title).strip()
-    t = re.sub(r"\s+", " ", t)
-    return t[:90]
+    return re.sub(r"\s+", " ", t)[:90]
 
 
 def build_pack(item):
-    """Everything Rohan (edit) + Reshab (post) need for virality. Template-based, $0."""
     topic = short_topic(item["title"])
     page = item.get("page", "ai")
     handle = HANDLES.get(page, "")
     q = quote_plus(topic[:60])
-    titles = [
-        f"{topic[:55]}",
-        f"POV: {topic[:50]}",
-        f"{topic[:40]} in 25 seconds",
-    ]
+    titles = [f"{topic[:55]}", f"POV: {topic[:50]}", f"{topic[:40]} in 25 seconds"]
     if page == "business":
         hook = f"STOP. {topic[:45]} just happened."
         hashtags = "#startup #business #founder #launch #money"
-        script = "0-1s hook above -> 1-8s what launched + proof screenshot -> 8-20s why it prints money -> 20-25s CTA follow for Day 2"
+        script = ("0-1s hook above -> 1-8s what launched + proof screenshot -> "
+                  "8-20s why it prints money -> 20-25s CTA follow for Day 2")
         cta = "Follow for startup launches daily"
     elif page == "entertainment":
-        hook = f"WAIT FOR IT. {topic[:45]} 😳"
+        hook = f"WAIT FOR IT. {topic[:45]}"
         hashtags = "#viral #funny #caught #live #drama"
-        script = "0-1s WAIT freeze-frame -> 1-6s buildup -> 6-20s payoff x2 replay zoom -> 20-25s comment bait"
+        script = ("0-1s WAIT freeze-frame -> 1-6s buildup -> 6-20s payoff x2 "
+                  "replay zoom -> 20-25s comment bait")
         cta = "Follow for daily viral drops"
     else:
         hook = f"AI JUST DROPPED: {topic[:50]}"
         hashtags = "#ai #ainews #tech #aitools #future"
-        script = "0-1s hook above -> 1-8s screen-record demo -> 8-18s before/after proof -> 18-25s where to try + CTA"
+        script = ("0-1s hook above -> 1-8s screen-record demo -> 8-18s "
+                  "before/after proof -> 18-25s where to try + CTA")
         cta = "Follow for AI drops daily"
-
     return {
-        "titles": titles,
-        "hook": hook,
-        "script": script,
-        "caption": f"{titles[0]}\n\n{clean(item.get('summary',''),150)}\n\n{cta} {handle}",
+        "titles": titles, "hook": hook, "script": script,
+        "caption": f"{titles[0]}\n\n{clean(item.get('summary', ''), 150)}\n\n{cta} {handle}",
         "hashtags": hashtags,
         "videos": {
             "YouTube search": f"https://www.youtube.com/results?search_query={q}",
@@ -271,40 +372,62 @@ def build_pack(item):
             "Pexels stock": f"https://www.pexels.com/search/{q}/",
             "Google News": f"https://news.google.com/search?q={q}",
         },
-        "expiry": "4-6 hrs (entertainment) / 12-24 hrs (biz/AI). If expired, skip.",
-        "rohan_edit": f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, progress bar, hook text 0-1s: {hook[:60]}. File: DATE_PAGE_FORMAT_01.",
-        "reshab_post": f"Post via phone apps, cover = hook text, first comment = question bait. Reply first 15 comments in 30 min.",
-        "credit": f"Source: {item['source']} {item['link']} — add 'via {item['source']}' + transformative edit (<30s) to avoid bans.",
+        "expiry": "4-6 hrs (entertainment) / 24h (biz/AI). If expired, skip.",
+        "rohan_edit": (f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, "
+                       f"progress bar, hook 0-1s: {hook[:60]}. File: DATE_PAGE_FORMAT_01."),
+        "reshab_post": ("Post via phone apps, cover = hook text, first comment = question bait. "
+                        "Reply first 15 comments in 30 min."),
+        "credit": (f"Source: {item['source']} {item['link']} — add 'via {item['source']}' "
+                   "+ transformative edit (<30s) to avoid bans."),
     }
 
 
 def format_digest(items):
-    lines = ["<b>\u26a1 INSTANT DROPS (2h scan)</b>", "Tap a button for full Viral Pack.\n"]
-    for i, it in enumerate(items, 1):
-        e = PAGE_EMOJI.get(it.get("page", "ai"), "")
-        lines.append(f"<b>{i}. {e} {html.escape(short_topic(it['title']))}</b>")
-        lines.append(f"   {html.escape(it['source'])} | {html.escape(it.get('page',''))} | <a href=\"{html.escape(it['link'])}\">link</a>")
-    lines.append("\nPhone: GitHub app → Run workflow → detail=N for full pack. Laptop on: tap button or /detail N.")
-    return "\n".join(lines)[:3800]
+    """Compat flat digest -> delegates to 3-category layout."""
+    cats = {"business": [], "entertainment": [], "ai": []}
+    for it in items:
+        cats.get(it.get("page", "ai"), cats["ai"]).append(it)
+    return format_digest_3cat(cats)
+
+
+def format_digest_3cat(cats):
+    L = ["<b>⚡ BEST OF BEST — fresh scan</b>"]
+    n = 0
+    order = (("business", "💼 FounderFiles | Business — startups just launched"),
+             ("entertainment", "🎬 ViralVault | Entertainment — crowd-verified viral"),
+             ("ai", "🤖 BotBrief | AI — new drops people feel"))
+    for key, head in order:
+        L.append(f"\n<b>{head}</b>")
+        items = cats.get(key, [])
+        if not items:
+            L.append("<i>Slow right now → Rohan cuts 1 filler, Reshab schedules it.</i>")
+            continue
+        for it in items:
+            n += 1
+            it["_n"] = n
+            L.append(f"<b>{n}. {html.escape(short_topic(it['title']))}</b>")
+            L.append(f"   ⭐{it.get('score', 0)} | {html.escape(it['source'])} | "
+                     f"<a href=\"{html.escape(it['link'])}\">link</a>")
+    L.append("\nPhone: GitHub app → Run workflow → detail=N for full Viral Pack. "
+             "Laptop on: tap button or /detail N.")
+    return "\n".join(L)[:3800]
 
 
 def format_pack(idx, item, pack):
-    L = []
-    L.append(f"<b>\U0001f525 VIRAL PACK #{idx} — {PAGE_NAMES.get(item.get('page','ai'))} {HANDLES.get(item.get('page','ai'),'')}</b>")
-    L.append(f"\U0001f4cc <b>{html.escape(short_topic(item['title']))}</b>")
-    L.append(f"📰 {html.escape(item['source'])} — <a href=\"{html.escape(item['link'])}\">source</a>")
-    L.append("")
-    L.append("<b>Titles (pick 1):</b>")
+    L = [f"<b>🔥 VIRAL PACK #{idx} — {PAGE_NAMES.get(item.get('page', 'ai'))} "
+         f"{HANDLES.get(item.get('page', 'ai'), '')}</b>",
+         f"📌 <b>{html.escape(short_topic(item['title']))}</b>",
+         f"📰 {html.escape(item['source'])} — "
+         f"<a href=\"{html.escape(item['link'])}\">source</a>", "",
+         "<b>Titles (pick 1):</b>"]
     for t in pack["titles"]:
         L.append(f"• {html.escape(t)}")
     L.append(f"\n<b>Hook 0-1s:</b> {html.escape(pack['hook'])}")
     L.append(f"<b>Script 25s:</b> {html.escape(pack['script'])}")
-    L.append("")
-    L.append("<b>Caption:</b>")
+    L.append("\n<b>Caption:</b>")
     L.append(f"<pre>{html.escape(pack['caption'][:300])}</pre>")
     L.append(f"<b>Hashtags:</b> {html.escape(pack['hashtags'])}")
-    L.append("")
-    L.append("<b>Videos (Rohan pulls from here):</b>")
+    L.append("\n<b>Videos (Rohan pulls from here):</b>")
     for k, v in pack["videos"].items():
         L.append(f"• <a href=\"{html.escape(v)}\">{k}</a>")
     L.append("")
@@ -316,9 +439,7 @@ def format_pack(idx, item, pack):
 
 
 def keyboard_for_items(items):
-    # Telegram inline keyboard: 2 buttons per row
-    kb = []
-    row = []
+    kb, row = [], []
     for i in range(1, len(items) + 1):
         row.append({"text": f"📦 Pack #{i}", "callback_data": f"pack:{i}"})
         if len(row) == 2:
