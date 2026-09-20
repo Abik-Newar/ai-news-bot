@@ -34,4 +34,4 @@ jobs:
           git config user.name "ai-news-bot"
           git config user.email "bot@localhost"
           git add seen.json news_cache.json || true
-          git diff --quiet && echo "no changes" || (git commit -m "update seen" && git push)
+          git diff HEAD --quiet && echo "no changes" || (git commit -m "update seen" && git push)
