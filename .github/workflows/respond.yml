@@ -1,7 +1,9 @@
 name: telegram-responder
-# INSTANT path: Cloudflare Worker sends repository_dispatch per message.
-# 30-min auto digest lives in ai-news-check (untouched). Manual Run = legacy poll fallback.
+# POLLING fallback = the reliable path. Every 5 min (fastest GitHub allows).
+# Instant Worker path (repository_dispatch below) is a bonus when its token is healthy.
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   repository_dispatch:
     types: [telegram]
   workflow_dispatch:

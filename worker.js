@@ -55,8 +55,10 @@ export default {
       // Trigger GitHub for the real work (RSS scan / detail pack / learn).
       // Uses repository_dispatch so the update payload travels with the trigger —
       // no getUpdates polling needed (which breaks while a webhook is active).
-      jobs.push(
-        fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
+      // NEVER fail silently: if GitHub rejects the trigger, tell the user why.
+      let dStatus = 0;
+      try {
+        const dr = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${env.GITHUB_TOKEN}`,
@@ -64,9 +66,30 @@ export default {
             "content-type": "application/json",
           },
           body: JSON.stringify({ event_type: "telegram", client_payload: { update } }),
-        }).catch(() => {})
-      );
+        });
+        dStatus = dr.status;
+      } catch (e) {
+        dStatus = -1;
+      }
       await Promise.all(jobs);
+      if (dStatus !== 204 && (msg && msg.chat)) {
+        const why =
+          dStatus === 404
+            ? "GITHUB_REPO name is wrong (must be exactly Abik-Newar/ai-news-bot)."
+            : dStatus === 401
+              ? "GITHUB_TOKEN is missing/invalid (fine-grained PAT, Actions Read+Write on this repo)."
+              : dStatus === 403
+                ? "GITHUB_TOKEN lacks permission (needs Actions Read+Write on this repo)."
+                : `GitHub said ${dStatus}. Re-paste GITHUB_TOKEN in Worker settings + Redeploy.`;
+        await fetch(`${tg}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            chat_id: msg.chat.id,
+            text: `⚠️ Instant link broken (${dStatus}). ${why}\nYour answer still arrives via the 5-min auto-check — nothing lost.`,
+          }),
+        }).catch(() => {});
+      }
       return new Response("ok");
     } catch (e) {
       return new Response("ok");
