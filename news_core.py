@@ -32,13 +32,26 @@ PAGE_NAMES = {
 }
 PAGE_EMOJI = {"business": "💼", "entertainment": "🎬", "ai": "🤖"}
 
-# ---- hard filters: these NEVER reach the pages (advertiser-safe, no junk) ----
-BLOCK = ["trump", "biden", "white house", "senate", "congress", "election",
-         "democrat", "republican", "putin", "gaza", "ukraine war", "parliament",
-         "minister ", " fundamentally", "arxiv", "[paper]",
+# ---- hard filters: NEVER reach the pages (process-politics, promo, mod posts) ----
+# NOTE: famous names are NOT blocked — people care about famous people.
+BLOCK = ["senate", "congress", "election", "democrat", "republican",
+         "parliament", "minister ", "white house", "arxiv", "[paper]",
          "ticket", "prices go up", "disrupt ", "webinar", "sponsored",
          "register now", "early bird", "use code ", "we're hiring",
-         "join our team", "blueprint", "whitepaper", "framework paper"]
+         "join our team", "blueprint", "whitepaper", "framework paper",
+         "to our ", "rules", "daily discussion", "open thread", "weekly thread",
+         "megathread", "sidebar", "lottery"]
+
+# Famous people = people care + feel something. Entertainment boost.
+FAMOUS = ["swift", "kelce", "bieber", "kardashian", "jenner", "hadid",
+          "grande", "eilish", "beyonce", "rihanna", "drake", "weeknd",
+          "ronaldo", "messi", "neymar", "kohli", "mrbeast", "pewdiepie",
+          "ishowspeed", "kaicenat", "musk", "gates", "bezos", "zuckerberg",
+          "cook", "altman", "hamilton", "verstappen", "dicaprio", "johansson",
+          "rock", "cena", "bts", "blackpink", "ambani", "shah rukh", "salman khan",
+          "alia", "virat", "modi", "taylor", "kylie", "kendall",
+          "ariana", "billie", "selena", "gomez", "zendaya", "holland",
+          "gosling", "chalamet", "adele"]
 
 BIZ_KW = ["launch", "launches", "startup", "startups", "founder", "founders",
           "funding", "raises", "raised", "seed", "series a", "series b", "ipo",
@@ -90,7 +103,7 @@ def categorize(title, summary, hint=None):
     low = f"{title} {summary}".lower()
     scores = {
         "business": _kw(low, BIZ_KW),
-        "entertainment": _kw(low, ENT_KW),
+        "entertainment": _kw(low, ENT_KW) + _kw(low, FAMOUS) * 2,
         "ai": _kw(low, AI_KW),
     }
     if hint in scores:
@@ -124,6 +137,9 @@ def rank(item):
     s = 0.0
     s += engagement_score(item.get("engagement", 0)) * 2.0
     s += emotion_bonus(item.get("title", "")) * 1.5
+    low = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+    if _kw(low, FAMOUS):
+        s += 2.5  # famous face = people care
     age_h = item.get("age_hours", 99)
     if age_h < 3:
         s += 3
@@ -280,8 +296,9 @@ def fetch_categorized(seen=None, per_page=3):
                 name = src.get("name", "").lower()
                 if "startup" in name or "techcrunch" in name:
                     pool.extend(_rss_items(src, 36))   # biz moves stay relevant ~1.5d
-                elif ("reddit" in name or "boredpanda" in name or "twisted" in name
-                        or "verge" in name):
+                elif ("reddit" in name or "verge" in name or "e! news" in name
+                        or "variety" in name or "deadline" in name
+                        or "justjared" in name or "fauxmoi" in name):
                     pool.extend(_rss_items(src, 18))   # entertainment expires fast
                 else:
                     pool.extend(_rss_items(src, 30))   # AI news ~1d
@@ -315,9 +332,10 @@ def _hint(item):
     s = item.get("source", "").lower()
     if "launch" in s or "show_hn" in s or "startup" in s or "product" in s:
         return "business"
-    if "reddit" in s or "boredpanda" in s or "twisted" in s or "verge" in s:
+    if ("reddit" in s or "verge" in s or "e!" in s or "variety" in s
+            or "deadline" in s or "justjared" in s or "fauxmoi" in s):
         return "entertainment"
-    return None  # HN front + blogs: let keywords vote
+    return None  # world + HN front + blogs: let keywords vote
 
 
 def fetch_all(seen=None, max_age_hours=12, max_per_run=9):

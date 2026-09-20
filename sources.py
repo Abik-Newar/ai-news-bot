@@ -12,8 +12,14 @@ SOURCES = [
     # Entertainment comes from viral RSS (Reddit recency + BoredPanda/TwistedSifter crowd-picked stories).
     {"name": "HackerNews AI", "url": "https://hn.algolia.com/api/v1/search?query=artificial%20intelligence&tags=story&hitsPerPage=10", "type": "hn"},
     {"name": "Reddit Videos", "url": "https://www.reddit.com/r/videos/.rss", "type": "rss"},
-    {"name": "BoredPanda Viral", "url": "https://www.boredpanda.com/feed/rss", "type": "rss"},
-    {"name": "TwistedSifter", "url": "https://twistedsifter.com/feed/", "type": "rss"},
+    {"name": "BBC World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml", "type": "rss"},
+    {"name": "CNN World", "url": "http://rss.cnn.com/rss/edition_world.rss", "type": "rss"},
+    {"name": "E! News", "url": "https://www.eonline.com/syndication/feeds/rssfeeds/topstories.xml", "type": "rss"},
+    {"name": "Variety", "url": "https://variety.com/feed/", "type": "rss"},
+    {"name": "Deadline", "url": "https://deadline.com/feed/", "type": "rss"},
+    {"name": "JustJared", "url": "https://www.justjared.com/feed/", "type": "rss"},
+    {"name": "Reddit FauxMoi", "url": "https://www.reddit.com/r/Fauxmoi/.rss", "type": "rss"},
+    {"name": "Interesting Engineering", "url": "https://interestingengineering.com/feed/", "type": "rss"},
     {"name": "HackerNews Front", "url": "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=20", "type": "hn"},
     {"name": "HackerNews Launch", "url": "https://hn.algolia.com/api/v1/search_by_date?query=startup%20launch&tags=show_hn&hitsPerPage=15", "type": "hn"},
 ]
