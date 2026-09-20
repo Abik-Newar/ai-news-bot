@@ -9,7 +9,7 @@ import json
 import time
 import requests
 
-from news_core import fetch_all, build_pack, format_digest, format_pack, keyboard_for_items
+from news_core import fetch_all, build_pack, format_digest, format_pack, keyboard_for_items, parse_command
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BASE = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
@@ -67,9 +67,10 @@ def send(chat_id, text, reply_markup=None):
     return api("sendMessage", payload)
 
 
-def do_news(chat_id, max_age=12, limit=10):
+def do_news(chat_id, boost=1.0, only_cat=None, limit=10):
     seen = load_seen()
-    items = fetch_all(seen=seen, max_age_hours=max_age, max_per_run=limit)
+    items = fetch_all(seen=seen, max_per_run=limit, window_boost=boost,
+                      only_cat=only_cat)
     # strip non-serializable pp tuples for cache
     cache_items = []
     for it in items:
@@ -99,23 +100,14 @@ def handle_update(upd):
     if msg:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
-        if text.startswith("/start") or text.startswith("/help"):
+        action = parse_command(text)
+        if action[0] == "help":
             send(chat_id, HELP)
-        elif text.startswith("/news"):
-            # /news [hours] e.g. /news 12
-            parts = text.split()
-            try:
-                h = int(parts[1]) if len(parts) > 1 else 6
-                h = max(1, min(h, 24))
-            except Exception:
-                h = 6
-            do_news(chat_id, max_age=h)
-        elif text.startswith("/detail"):
-            parts = text.split()
-            try:
-                do_pack(chat_id, int(parts[1]))
-            except Exception:
-                send(chat_id, "Use: /detail N  (e.g. /detail 2)")
+        elif action[0] == "news":
+            _, boost, cat = action
+            do_news(chat_id, boost=boost, only_cat=cat)
+        elif action[0] == "detail":
+            do_pack(chat_id, action[1])
         return
     cb = upd.get("callback_query")
     if cb:

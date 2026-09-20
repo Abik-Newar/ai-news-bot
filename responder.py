@@ -6,8 +6,8 @@ import os
 import json
 import requests
 
-from news_core import (fetch_all, build_pack, format_digest,
-                       format_pack, keyboard_for_items)
+from news_core import (fetch_all, build_pack, format_digest_3cat,
+                       format_pack, keyboard_for_items, parse_command)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BASE = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
@@ -16,10 +16,14 @@ STATE_FILE = os.path.join(HERE, "telegram_state.json")
 CACHE_FILE = os.path.join(HERE, "news_cache.json")
 SEEN_FILE = os.path.join(HERE, "seen.json")
 
-HELP = ("⚡ <b>Instant Pipeline</b> — type <b>news</b> for best-of-best.\n"
-        "💼 Business (FounderFiles) | 🎬 Entertainment (ViralVault) | 🤖 AI (BotBrief)\n"
-        "Then <b>/detail N</b> or tap 📦 for the full Viral Pack "
-        "(titles, hook, script, caption, hashtags, video links, Rohan + Reshab notes).")
+HELP = ("⚡ <b>Instant Pipeline — chat commands</b>\n"
+        "<b>news</b> — best-of-best: 💼 Business | 🎬 Entertainment | 🤖 AI\n"
+        "(every item shows WHEN it went public)\n"
+        "<b>more</b> — older batch, skips what you saw\n"
+        "<b>more business</b> / <b>more ai</b> / <b>more entertainment</b> — top-up one page\n"
+        "<b>more 48h</b> — dig up to 2 days back\n"
+        "<b>detail 2</b> — full Viral Pack for #2 (titles, hook, script, caption, "
+        "hashtags, video links, Rohan + Reshab notes)")
 
 
 def load_json(path, default):
@@ -55,9 +59,17 @@ def send(chat_id, text, reply_markup=None):
         return False
 
 
-def do_news(chat_id):
+def _cats_for_display(items):
+    cats = {"business": [], "entertainment": [], "ai": []}
+    for it in items:
+        cats.get(it.get("page", "ai"), cats["ai"]).append(it)
+    return cats
+
+
+def do_news(chat_id, boost=1.0, only_cat=None):
     seen = set(load_json(SEEN_FILE, []))
-    items = fetch_all(seen=seen, max_per_run=9)
+    items = fetch_all(seen=seen, max_per_run=9, window_boost=boost,
+                      only_cat=only_cat)
     cache = [{k: v for k, v in it.items() if k != "pp" and not k.startswith("_")}
              for it in items]
     # keep visible numbers stable for /detail
@@ -65,15 +77,16 @@ def do_news(chat_id):
         c["_n"] = i
     save_json(CACHE_FILE, cache)
     if not items:
-        send(chat_id, "Slow window — no best-of-best right now. "
-                      "Rohan cuts 1 filler, Reshab schedules it.")
+        send(chat_id, "Nothing more in this window. Try <b>more 48h</b> for older news, "
+                      "or Rohan cuts 1 filler.")
         return
     for it in items:
         seen.add(it["link"])
     save_json(SEEN_FILE, sorted(seen)[-1000:])
     flat = [{**c, "_n": i + 1} for i, c in enumerate(cache)]
-    send(chat_id, format_digest(flat), reply_markup=keyboard_for_items(flat))
-    print(f"news -> {chat_id}: {len(flat)} items")
+    send(chat_id, format_digest_3cat(_cats_for_display(flat), older=boost > 1.0),
+         reply_markup=keyboard_for_items(flat))
+    print(f"news(boost={boost},cat={only_cat}) -> {chat_id}: {len(flat)} items")
 
 
 def do_pack(chat_id, idx):
@@ -91,15 +104,13 @@ def handle(upd):
     if msg:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
-        low = text.lower()
-        if low in ("news", "/news", "/news@lynqstudiobot"):
-            do_news(chat_id)
-        elif low.startswith("/detail"):
-            try:
-                do_pack(chat_id, int(low.split()[1]))
-            except Exception:
-                send(chat_id, "Use /detail N — e.g. /detail 2")
-        elif low.startswith("/start") or low.startswith("/help"):
+        action = parse_command(text)
+        if action[0] == "news":
+            _, boost, cat = action
+            do_news(chat_id, boost=boost, only_cat=cat)
+        elif action[0] == "detail":
+            do_pack(chat_id, action[1])
+        elif action[0] == "help":
             send(chat_id, HELP)
         return
     cb = upd.get("callback_query")

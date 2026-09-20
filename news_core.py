@@ -185,18 +185,20 @@ def _rss_items(src, max_age_hours):
             if not any(k in low for k in KEYWORDS):
                 continue
         pp = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
-        age_h = 99
+        age_h, pub = 99, ""
         if pp:
             try:
                 dt = datetime(*pp[:6], tzinfo=timezone.utc)
                 age_h = (now_utc() - dt).total_seconds() / 3600
+                pub = dt.isoformat(timespec="minutes")
             except Exception:
                 pass
         if age_h > max_age_hours:
             continue
         items.append({"title": clean(title, 160), "link": link,
                       "source": src["name"], "summary": clean(summary, 400),
-                      "engagement": 0, "age_hours": round(age_h, 1)})
+                      "engagement": 0, "age_hours": round(age_h, 1),
+                      "published": pub})
     return items
 
 
@@ -221,15 +223,16 @@ def _hn_items(src, max_age_hours, min_points=30):
             dt = (parsedate_to_datetime(ca) if "GMT" in ca
                   else datetime.fromisoformat(ca.replace("Z", "+00:00")))
             age_h = (now_utc() - dt).total_seconds() / 3600
+            pub = dt.isoformat(timespec="minutes")
         except Exception:
-            age_h = 99
+            age_h, pub = 99, ""
         if age_h > max_age_hours:
             continue
         items.append({"title": clean(title, 160), "link": link,
                       "source": "HackerNews",
                       "summary": f"{pts} points, {h.get('num_comments', 0)} comments",
                       "engagement": pts + (h.get("num_comments", 0) or 0),
-                      "age_hours": round(age_h, 1)})
+                      "age_hours": round(age_h, 1), "published": pub})
     return items
 
 
@@ -277,9 +280,11 @@ def _reddit_items(max_age_hours=12, min_score=1500):
     return items
 
 
-def fetch_categorized(seen=None, per_page=3):
-    """Returns {business:[...], entertainment:[...], ai:[...]} — best of best only."""
+def fetch_categorized(seen=None, per_page=3, window_boost=1.0):
+    """Returns {business:[...], entertainment:[...], ai:[...]} — best of best only.
+    window_boost>1 looks further back (for 'more'/'older' requests)."""
     seen = seen or set()
+    wb = max(1.0, min(window_boost, 5.0))
     pool = []
     for src in SOURCES:
         t = src.get("type")
@@ -287,25 +292,25 @@ def fetch_categorized(seen=None, per_page=3):
             if t == "hn":
                 # Show HN / launches: fresher window, lower bar (new things)
                 if "launch" in src.get("name", "").lower() or "show" in src.get("url", "").lower():
-                    pool.extend(_hn_items(src, 36, 15))
+                    pool.extend(_hn_items(src, 36 * wb, 15))
                 else:
-                    pool.extend(_hn_items(src, 36, 40))
+                    pool.extend(_hn_items(src, 36 * wb, 40))
             elif t == "arxiv":
                 continue  # papers = filler bank, never instant
             else:
                 name = src.get("name", "").lower()
                 if "startup" in name or "techcrunch" in name:
-                    pool.extend(_rss_items(src, 36))   # biz moves stay relevant ~1.5d
+                    pool.extend(_rss_items(src, 36 * wb))   # biz moves stay relevant
                 elif ("reddit" in name or "verge" in name or "e! news" in name
                         or "variety" in name or "deadline" in name
-                        or "justjared" in name or "fauxmoi" in name):
-                    pool.extend(_rss_items(src, 18))   # entertainment expires fast
+                        or "justjared" in name or "fauxmoi" in name
+                        or "bbc" in name or "cnn" in name):
+                    pool.extend(_rss_items(src, 24 * wb))   # world/ent expires
                 else:
-                    pool.extend(_rss_items(src, 30))   # AI news ~1d
+                    pool.extend(_rss_items(src, 30 * wb))   # AI news
         except Exception as ex:
             print("fetch fail", src.get("name"), str(ex)[:80])
         time.sleep(0.2)
-    # entertainment comes from viral RSS pool above (Reddit recency + BoredPanda/TwistedSifter).
 
     # dedup + seen + rank
     best = {}
@@ -338,15 +343,64 @@ def _hint(item):
     return None  # world + HN front + blogs: let keywords vote
 
 
-def fetch_all(seen=None, max_age_hours=12, max_per_run=9):
-    """Compat: flat list, interleaved by category so every page is represented."""
-    cats = fetch_categorized(seen=seen, per_page=max(2, max_per_run // 3))
+def fetch_all(seen=None, max_age_hours=12, max_per_run=9, window_boost=1.0,
+              only_cat=None):
+    """Flat list, interleaved by category. only_cat = top-up one page."""
+    cats = fetch_categorized(seen=seen, per_page=max(2, max_per_run // 3),
+                             window_boost=window_boost)
+    if only_cat in cats:
+        return cats[only_cat][:max_per_run]
     flat = []
-    for i in range(max(len(v) for v in cats.values())):
+    for i in range(max([len(v) for v in cats.values()] + [0])):
         for k in ("business", "entertainment", "ai"):
             if i < len(cats[k]):
                 flat.append(cats[k][i])
     return flat[:max_per_run]
+
+
+def fmt_age(item):
+    """'🕒 5h ago · Sep 20 14:30' — when it went public on the internet."""
+    a = item.get("age_hours", 99)
+    if a >= 90:
+        age = "date unknown"
+    elif a < 1:
+        age = f"{max(int(a * 60), 1)}m ago"
+    elif a < 48:
+        age = f"{int(a)}h ago" if a < 24 else f"{int(a // 24)}d ago"
+    else:
+        age = f"{int(a // 24)}d ago"
+    pub = (item.get("published") or "")[:16].replace("T", " ")
+    return f"🕒 {age}" + (f" · {pub}" if pub else "")
+
+
+def parse_command(text):
+    """Plain chat words -> action. Returns tuples:
+    ('news', boost, only_cat) | ('detail', n) | ('help',) | (None,)"""
+    t = (text or "").strip().lower().split("@")[0].strip()
+    if not t:
+        return (None,)
+    if t in ("hi", "hello", "hey", "/start", "start", "/help", "help"):
+        return ("help",)
+    m = re.match(r"^/?details?\s+(\d+)", t) or re.match(r"^#?(\d+)$", t)
+    if m:
+        return ("detail", int(m.group(1)))
+    if "detail" in t and not re.search(r"\d", t):
+        return ("help",)
+    cat = None
+    if any(w in t for w in ("business", "founder", "startup", "money")):
+        cat = "business"
+    elif any(w in t for w in ("entertainment", "viral", "celebr", "famous", "movie", "music")):
+        cat = "entertainment"
+    elif re.search(r"(?<![a-z])ai(?![a-z])", t):
+        cat = "ai"
+    m2 = re.search(r"(\d+)\s*h", t)
+    if m2:  # "24h", "news 48h" -> look that far back
+        return ("news", max(1.0, min(int(m2.group(1)) / 12.0, 5.0)), cat)
+    if any(w in t for w in ("more", "older", "other", "another", "different", "new ones", "next")):
+        return ("news", 2.5, cat)
+    if "news" in t or cat:
+        return ("news", 1.0, cat)
+    return (None,)
 
 
 # ---------------- packs + digest ----------------
@@ -408,26 +462,28 @@ def format_digest(items):
     return format_digest_3cat(cats)
 
 
-def format_digest_3cat(cats):
-    L = ["<b>⚡ BEST OF BEST — fresh scan</b>"]
+def format_digest_3cat(cats, older=False):
+    L = ["<b>⚡ BEST OF BEST — fresh scan</b>" if not older
+         else "<b>📦 MORE NEWS — further back, skipping what you saw</b>"]
     n = 0
     order = (("business", "💼 FounderFiles | Business — startups just launched"),
-             ("entertainment", "🎬 ViralVault | Entertainment — crowd-verified viral"),
+             ("entertainment", "🎬 ViralVault | Entertainment — famous people"),
              ("ai", "🤖 BotBrief | AI — new drops people feel"))
     for key, head in order:
         L.append(f"\n<b>{head}</b>")
         items = cats.get(key, [])
         if not items:
-            L.append("<i>Slow right now → Rohan cuts 1 filler, Reshab schedules it.</i>")
+            L.append("<i>Nothing more here — try 'more' + hours back, e.g. 'more 48h'.</i>")
             continue
         for it in items:
             n += 1
             it["_n"] = n
             L.append(f"<b>{n}. {html.escape(short_topic(it['title']))}</b>")
-            L.append(f"   ⭐{it.get('score', 0)} | {html.escape(it['source'])} | "
+            L.append(f"   {fmt_age(it)} | ⭐{it.get('score', 0)} | {html.escape(it['source'])} | "
                      f"<a href=\"{html.escape(it['link'])}\">link</a>")
-    L.append("\nPhone: GitHub app → Run workflow → detail=N for full Viral Pack. "
-             "Laptop on: tap button or /detail N.")
+    L.append("\nWant others? Type: <b>more</b> (older batch) · <b>more business / more ai / "
+             "more entertainment</b> (top-up a page) · <b>more 48h</b> (2 days back).\n"
+             "Details: <b>detail N</b> or tap 📦.")
     return "\n".join(L)[:3800]
 
 
@@ -435,6 +491,7 @@ def format_pack(idx, item, pack):
     L = [f"<b>🔥 VIRAL PACK #{idx} — {PAGE_NAMES.get(item.get('page', 'ai'))} "
          f"{HANDLES.get(item.get('page', 'ai'), '')}</b>",
          f"📌 <b>{html.escape(short_topic(item['title']))}</b>",
+         f"{fmt_age(item)} — when it went public",
          f"📰 {html.escape(item['source'])} — "
          f"<a href=\"{html.escape(item['link'])}\">source</a>", "",
          "<b>Titles (pick 1):</b>"]
