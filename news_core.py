@@ -132,6 +132,98 @@ def engagement_score(eng):
         return 0
 
 
+# ---------------- taste learning: feed examples -> pattern ----------------
+# $0, no LLM. Stores keyword/source/page weights in taste.json.
+# You send 5-15 examples of "best news", bot boosts similar in future.
+import os as _os
+import json as _json
+
+TASTE_FILE = _os.path.join(_os.path.dirname(__file__), "taste.json")
+_STOP = set("the a an of to in on for with and or is are was were be by at from as it its this that these those will just new day than then than vs via over under out up into over after before".split())
+
+
+def _tokens(text):
+    toks = re.findall(r"[a-z0-9$]+", (text or "").lower())
+    return [t for t in toks if len(t) > 2 and t not in _STOP][:30]
+
+
+def load_taste():
+    try:
+        with open(TASTE_FILE) as f:
+            d = _json.load(f)
+            if isinstance(d, dict):
+                d.setdefault("kw", {})
+                d.setdefault("src", {})
+                d.setdefault("page", {})
+                d.setdefault("n", 0)
+                return d
+    except Exception:
+        pass
+    return {"kw": {}, "src": {}, "page": {}, "n": 0}
+
+
+def save_taste(d):
+    try:
+        with open(TASTE_FILE, "w") as f:
+            _json.dump(d, f)
+    except Exception as ex:
+        print("taste save fail", str(ex)[:80])
+
+
+def learn_example(title, source="", page="", link=""):
+    """Learn one example. Returns tokens learned."""
+    d = load_taste()
+    toks = _tokens(title)
+    for t in toks:
+        d["kw"][t] = d["kw"].get(t, 0) + 1
+    if source:
+        s = source.strip().lower()[:60]
+        d["src"][s] = d["src"].get(s, 0) + 1
+    if page in ("business", "entertainment", "ai"):
+        d["page"][page] = d["page"].get(page, 0) + 1
+    d["n"] = d.get("n", 0) + 1
+    # keep file small: top 200 keywords only
+    if len(d["kw"]) > 200:
+        top = sorted(d["kw"].items(), key=lambda x: -x[1])[:200]
+        d["kw"] = dict(top)
+    save_taste(d)
+    return toks
+
+
+def taste_boost(item):
+    """Extra score from learned taste. 0 if no training yet."""
+    d = load_taste()
+    if not d.get("n"):
+        return 0.0
+    toks = set(_tokens(f"{item.get('title','')} {item.get('summary','')}"))
+    s = 0.0
+    for t in toks:
+        c = d["kw"].get(t, 0)
+        if c >= 2:
+            s += min(c * 0.4, 2.0)
+        elif c == 1:
+            s += 0.3
+    src = (item.get("source") or "").lower()[:60]
+    if src and d["src"].get(src):
+        s += min(d["src"][src] * 0.5, 1.5)
+    pg = item.get("page")
+    if pg and d["page"].get(pg):
+        s += min(d["page"][pg] * 0.2, 1.0)
+    return round(min(s, 6.0), 2)
+
+
+def taste_summary():
+    d = load_taste()
+    if not d.get("n"):
+        return "No training yet. Send 5-15 examples like:\nlearn: OpenAI launches Sora 2 with audit logs"
+    top_kw = sorted(d["kw"].items(), key=lambda x: -x[1])[:15]
+    top_src = sorted(d["src"].items(), key=lambda x: -x[1])[:8]
+    return (f"Trained on {d.get('n',0)} examples.\n"
+            f"Top keywords: {', '.join(f'{k}({v})' for k,v in top_kw)}\n"
+            f"Top sources: {', '.join(f'{k}({v})' for k,v in top_src)}\n"
+            f"Pages: {d.get('page',{})}")
+
+
 def rank(item):
     """Single number: higher = people care + feel something + fresh."""
     s = 0.0
@@ -140,6 +232,7 @@ def rank(item):
     low = f"{item.get('title', '')} {item.get('summary', '')}".lower()
     if _kw(low, FAMOUS):
         s += 2.5  # famous face = people care
+    s += taste_boost(item)  # learned from your examples
     age_h = item.get("age_hours", 99)
     if age_h < 3:
         s += 3
@@ -415,28 +508,65 @@ def build_pack(item):
     page = item.get("page", "ai")
     handle = HANDLES.get(page, "")
     q = quote_plus(topic[:60])
+    # Style learned from @getintoai (818K), @artificialintelligenceee (911K), @bbcnews
+    # AI pages: plain-sentence title, explainer + question bait + Follow + Source + 3-5 tags
+    # BBC: factual title, 1-sentence fact + location tags + #bbcnews, clean photo, no big text
     titles = [f"{topic[:55]}", f"POV: {topic[:50]}", f"{topic[:40]} in 25 seconds"]
+    # image overlay text: 5-7 words uppercase for slide1 / video cover
+    overlay = re.sub(r"[^A-Za-z0-9 ]", "", topic).strip().upper().split()
+    overlay = " ".join(overlay[:7]) if overlay else topic[:30].upper()
     if page == "business":
         hook = f"STOP. {topic[:45]} just happened."
         hashtags = "#startup #business #founder #launch #money"
         script = ("0-1s hook above -> 1-8s what launched + proof screenshot -> "
                   "8-20s why it prints money -> 20-25s CTA follow for Day 2")
         cta = "Follow for startup launches daily"
+        caption = (f"{titles[0]}\n\n{clean(item.get('summary', ''), 150)}\n\n{cta} {handle}")
     elif page == "entertainment":
         hook = f"WAIT FOR IT. {topic[:45]}"
         hashtags = "#viral #funny #caught #live #drama"
         script = ("0-1s WAIT freeze-frame -> 1-6s buildup -> 6-20s payoff x2 "
                   "replay zoom -> 20-25s comment bait")
         cta = "Follow for daily viral drops"
+        # BBC-style: factual, no hype caps in caption
+        caption = (f"{titles[0]}\n\n{clean(item.get('summary', ''), 140)}\n\n{cta} {handle}")
     else:
-        hook = f"AI JUST DROPPED: {topic[:50]}"
-        hashtags = "#ai #ainews #tech #aitools #future"
-        script = ("0-1s hook above -> 1-8s screen-record demo -> 8-18s "
-                  "before/after proof -> 18-25s where to try + CTA")
-        cta = "Follow for AI drops daily"
+        # getintoai formula: plain title + 2-sentence explainer + question + Follow + Source
+        hook = topic[:60]  # no caps hype, plain like getintoai
+        hashtags = "#ai #ainews #aiupdates"
+        script = ("0-1s overlay text only (no voice hype) -> 1-8s screen-record demo -> 8-18s "
+                  "before/after proof -> 18-25s question bait on screen + CTA")
+        summary = clean(item.get('summary', ''), 180)
+        # question bait like getintoai: "What do you think...?"
+        qbait = "What do you think — hype or real shift? 💬"
+        low_t = topic.lower()
+        if "robot" in low_t:
+            qbait = "Would you trust a robot to do this better than a human? 🤔💬"
+        elif "price" in low_t or "market" in low_t or "billion" in low_t or "million" in low_t:
+            qbait = "Growing AI future or bubble waiting to burst? 🤔💬"
+        elif "space" in low_t or "science" in low_t:
+            qbait = "Are we just scratching the surface of AI's potential? 🚀💬"
+        cta = f"Follow for more {handle} 🔌 Source: {item.get('source','')}"
+        caption = f"{titles[0]}\n\n{summary}\n\n{qbait}\n{cta}\n{hashtags}"
+    if page == "ai":
+        rohan_note = (f"CapCut {PAGE_NAMES[page]} template 1080x1920, captions ON. "
+                      f"Slide1/carousel cover text (bold white, 5-7 words): {overlay}. "
+                      f"Reel: screen-record demo, subtitles, no hype voice. File: DATE_PAGE_FORMAT_01.")
+        reshab_note = ("Cover = overlay text above. Caption = title + explainer + question + Follow + Source. "
+                       "First comment = same question bait. Reply first 15 in 30 min. Tags: #ai #ainews #aiupdates.")
+    elif page == "entertainment":
+        rohan_note = (f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920. BBC-style if world news: clean photo, "
+                      f"minimal text, subtitles only. If viral: freeze-frame + zoom x2. Cover: {overlay}.")
+        reshab_note = "BBC-style: 1-sentence fact + #location #bbcnews style tags. Viral-style: WAIT + comment bait."
+    else:
+        rohan_note = (f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, "
+                      f"progress bar, hook 0-1s: {hook[:60]}. File: DATE_PAGE_FORMAT_01.")
+        reshab_note = ("Post via phone apps, cover = hook text, first comment = question bait. "
+                       "Reply first 15 comments in 30 min.")
     return {
         "titles": titles, "hook": hook, "script": script,
-        "caption": f"{titles[0]}\n\n{clean(item.get('summary', ''), 150)}\n\n{cta} {handle}",
+        "caption": caption,
+        "image_text": overlay,
         "hashtags": hashtags,
         "videos": {
             "YouTube search": f"https://www.youtube.com/results?search_query={q}",
@@ -445,10 +575,8 @@ def build_pack(item):
             "Google News": f"https://news.google.com/search?q={q}",
         },
         "expiry": "4-6 hrs (entertainment) / 24h (biz/AI). If expired, skip.",
-        "rohan_edit": (f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, "
-                       f"progress bar, hook 0-1s: {hook[:60]}. File: DATE_PAGE_FORMAT_01."),
-        "reshab_post": ("Post via phone apps, cover = hook text, first comment = question bait. "
-                        "Reply first 15 comments in 30 min."),
+        "rohan_edit": rohan_note,
+        "reshab_post": reshab_note,
         "credit": (f"Source: {item['source']} {item['link']} — add 'via {item['source']}' "
                    "+ transformative edit (<30s) to avoid bans."),
     }
@@ -498,6 +626,7 @@ def format_pack(idx, item, pack):
     for t in pack["titles"]:
         L.append(f"• {html.escape(t)}")
     L.append(f"\n<b>Hook 0-1s:</b> {html.escape(pack['hook'])}")
+    L.append(f"<b>Image text (cover/slide1):</b> {html.escape(pack.get('image_text',''))}")
     L.append(f"<b>Script 25s:</b> {html.escape(pack['script'])}")
     L.append("\n<b>Caption:</b>")
     L.append(f"<pre>{html.escape(pack['caption'][:300])}</pre>")

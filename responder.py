@@ -7,7 +7,9 @@ import json
 import requests
 
 from news_core import (fetch_all, build_pack, format_digest_3cat,
-                       format_pack, keyboard_for_items, parse_command)
+                       format_pack, keyboard_for_items, parse_command,
+                       learn_example, taste_summary, load_taste, save_taste,
+                       categorize)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BASE = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
@@ -23,7 +25,12 @@ HELP = ("⚡ <b>Instant Pipeline — chat commands</b>\n"
         "<b>more business</b> / <b>more ai</b> / <b>more entertainment</b> — top-up one page\n"
         "<b>more 48h</b> — dig up to 2 days back\n"
         "<b>detail 2</b> — full Viral Pack for #2 (titles, hook, script, caption, "
-        "hashtags, video links, Rohan + Reshab notes)")
+        "hashtags, video links, Rohan + Reshab notes)\n\n"
+        "<b>TRAINING:</b>\n"
+        "<b>learn: Title here | source optional</b> — feed 5-15 best-news examples\n"
+        "<b>good 2</b> — mark pack #2 as good (learns it)\n"
+        "<b>taste</b> — show what bot learned\n"
+        "<b>reset taste</b> — clear training")
 
 
 def load_json(path, default):
@@ -99,11 +106,67 @@ def do_pack(chat_id, idx):
     print(f"pack #{idx} -> {chat_id}")
 
 
+def do_taste(chat_id):
+    send(chat_id, taste_summary())
+    print("taste shown")
+
+
+def do_learn_text(chat_id, raw):
+    # "learn: title here" -> learn it. Also plain links/titles.
+    txt = raw.strip()
+    low = txt.lower()
+    if low.startswith("learn:"):
+        txt = txt[6:].strip()
+    # split "title | source" if given
+    parts = [p.strip() for p in txt.split("|")]
+    title = parts[0][:200]
+    source = parts[1][:60] if len(parts) > 1 else ""
+    if len(title) < 10:
+        send(chat_id, "Too short. Send like:\n<b>learn: OpenAI launches Sora 2 with audit logs</b>")
+        return
+    page = categorize(title, source) or "ai"
+    toks = learn_example(title, source=source, page=page)
+    n = load_taste().get("n", 0)
+    send(chat_id, f"✅ Learned ({n} total) → <b>{page}</b>\n"
+                  f"{title[:120]}\n"
+                  f"<i>keywords: {', '.join(toks[:8])}</i>\n"
+                  f"Send 5-15 like this, then type <b>news</b> to see boost. Type <b>taste</b> to see pattern.")
+    print(f"learned: {title[:60]}")
+
+
 def handle(upd):
     msg = upd.get("message") or upd.get("channel_post")
     if msg:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
+        low = text.lower()
+        # training commands first (before news parse)
+        if low in ("taste", "/taste"):
+            do_taste(chat_id)
+            return
+        if low in ("reset taste", "/reset", "reset"):
+            save_taste({"kw": {}, "src": {}, "page": {}, "n": 0})
+            send(chat_id, "🗑 Taste cleared. Feed fresh examples with <b>learn:</b>")
+            return
+        if low.startswith("learn:") or low.startswith("/learn"):
+            do_learn_text(chat_id, text)
+            return
+        import re as _re
+        m = _re.match(r"^(good|like|🔥|👍)\s+(\d+)", low)
+        if m:
+            idx = int(m.group(2))
+            cache = load_json(CACHE_FILE, [])
+            if 1 <= idx <= len(cache):
+                it = cache[idx - 1]
+                learn_example(it.get("title",""), source=it.get("source",""), page=it.get("page",""))
+                send(chat_id, f"✅ Pack #{idx} learned as GOOD. Future <b>news</b> will boost similar.")
+            else:
+                send(chat_id, f"Pack #{idx} expired. Type news first.")
+            return
+        # plain URL or long headline pasted without command = auto-learn
+        if ("http://" in low or "https://" in low or low.startswith("www.")) and len(text) > 20:
+            do_learn_text(chat_id, text)
+            return
         action = parse_command(text)
         if action[0] == "news":
             _, boost, cat = action
@@ -112,6 +175,11 @@ def handle(upd):
             do_pack(chat_id, action[1])
         elif action[0] == "help":
             send(chat_id, HELP)
+        else:
+            # unknown long text (>15 chars) = treat as example to learn
+            if len(text) > 15 and " " in text:
+                do_learn_text(chat_id, text)
+            # else ignore (avoids spam replies)
         return
     cb = upd.get("callback_query")
     if cb:
