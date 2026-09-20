@@ -1,5 +1,6 @@
-# bot.py — 2-hour digest sender (GitHub Actions). Interactive expansion lives in tbot.py.
+# bot.py — 30-min auto digest sender (GitHub Actions, cloud only, no laptop).
 # Keeps $0: RSS -> Telegram group with numbered list + tap-to-expand buttons.
+# Only BEST news auto-pushes (MIN_SCORE filter). Manual detail via DETAIL_N env.
 import os
 import json
 import requests
@@ -64,22 +65,35 @@ def main():
         print(f"done: detail pack #{detail_n}")
         return
     seen = load_seen()
-    # 12h window = 2h cadence + overlap so nothing is missed if one run fails
+    # 2h window = 30-min cadence + overlap so nothing is missed if one run fails
     items = fetch_all(seen=seen, max_age_hours=hours, max_per_run=10)
+    # BEST-ONLY filter for auto-push: skip low-score filler silently
+    try:
+        min_score = float(os.environ.get("MIN_SCORE", "2.0") or "2.0")
+    except Exception:
+        min_score = 2.0
+    best = [it for it in items if it.get("score", 0) >= min_score]
     # save cache for /detail lookup (strip non-serializable pp)
-    cache_items = [{k: v for k, v in it.items() if k != "pp"} for it in items]
+    cache_items = [{k: v for k, v in it.items() if k != "pp"} for it in best]
     with open(CACHE_FILE, "w") as f:
         json.dump(cache_items, f)
-    if not items:
-        print("done: found=0 (slow news day -> filler bank)")
+    if not best:
+        # mark even filler as seen so next 30-min run doesn't reprocess same pool
+        for it in items:
+            seen.add(it["link"])
+        save_seen(seen)
+        print(f"done: found={len(items)} but none >= MIN_SCORE {min_score} (quiet, no telegram spam)")
         return
     ok = send_digest(format_digest(cache_items), keyboard_for_items(cache_items))
-    for it in items:
+    for it in best:
         seen.add(it["link"])
         if not ok and not os.environ.get("TELEGRAM_BOT_TOKEN"):
             print("DRAFT:", it.get("page"), "|", it["title"][:80], "|", it["link"])
+    # also remember skipped filler so pool stays fresh
+    for it in items:
+        seen.add(it["link"])
     save_seen(seen)
-    print(f"done: found={len(items)}")
+    print(f"done: found={len(items)} sent={len(best)}")
 
 
 if __name__ == "__main__":

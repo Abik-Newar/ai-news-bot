@@ -1,7 +1,7 @@
 name: ai-news-check
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       detail:
@@ -9,9 +9,9 @@ on:
         required: false
         default: '0'
       hours:
-        description: 'Lookback hours (6/12/24)'
+        description: 'Lookback hours (1/2/6/12)'
         required: false
-        default: '12'
+        default: '2'
 
 jobs:
   check:
@@ -23,15 +23,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
       - run: pip install -r requirements.txt
+      # 1) auto-push BEST news only (MIN_SCORE filter inside bot.py)
       - run: python bot.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DETAIL_N: ${{ inputs.detail }}
           HOURS: ${{ inputs.hours }}
+          MIN_SCORE: '2.0'
+      # 2) reply to pending Telegram commands (news/detail/learn/taste) in same run
+      - run: python responder.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       - run: |
           git config user.name "ai-news-bot"
           git config user.email "bot@localhost"
-          git add seen.json news_cache.json taste.json || true
+          git add seen.json news_cache.json telegram_state.json taste.json || true
           git diff HEAD --quiet && echo "no changes" || (git commit -m "update seen" && git push)
