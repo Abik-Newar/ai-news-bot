@@ -1,7 +1,9 @@
 name: telegram-responder
-# Disabled schedule: replies now run inside ai-news-check every 30 min (single job = half the minutes).
-# Keep manual trigger for on-demand reply without waiting.
+# INSTANT path: Cloudflare Worker sends repository_dispatch per message.
+# 30-min auto digest lives in ai-news-check (untouched). Manual Run = legacy poll fallback.
 on:
+  repository_dispatch:
+    types: [telegram]
   workflow_dispatch:
 
 jobs:

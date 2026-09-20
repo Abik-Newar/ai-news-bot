@@ -199,6 +199,26 @@ def main():
     if not TOKEN:
         print("No TELEGRAM_BOT_TOKEN.")
         return
+    # INSTANT mode: Cloudflare Worker forwards the Telegram update via
+    # repository_dispatch (client_payload.update). Handle it directly —
+    # getUpdates does NOT work while a webhook is active, so never poll here.
+    event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+    if event_path:
+        try:
+            with open(event_path) as f:
+                ev = json.load(f)
+        except Exception as ex:
+            print("event parse err", str(ex)[:80])
+            ev = {}
+        payload = (ev.get("client_payload") or {}).get("update")
+        if payload:
+            try:
+                handle(payload)
+            except Exception as ex:
+                print("handle err", str(ex)[:100])
+            print("done: dispatch update handled")
+            return
+        # manual "Run workflow" has no payload -> fall through to legacy poll
     state = load_json(STATE_FILE, {})
     offset = state.get("last_update_id", 0) + 1
     try:
