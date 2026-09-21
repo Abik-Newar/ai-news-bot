@@ -61,9 +61,10 @@ export default {
           const idx = parseInt(data.split(":")[1], 10);
           const { cache, err } = await loadCache(env);
           if (cache && idx >= 1 && idx <= cache.length) {
+            const pack = await buildPack(cache[idx - 1]);
             await tgApi(tg, "sendMessage", {
               chat_id: chatId,
-              text: formatPack(idx, cache[idx - 1], buildPack(cache[idx - 1])),
+              text: formatPack(idx, cache[idx - 1], pack),
               parse_mode: "HTML",
               disable_web_page_preview: false,
             });
@@ -97,9 +98,10 @@ export default {
           const idx = parseInt(detailMatch[1], 10);
           const { cache, err } = await loadCache(env);
           if (cache && idx >= 1 && idx <= cache.length) {
+            const pack = await buildPack(cache[idx - 1]);
             await tgApi(tg, "sendMessage", {
               chat_id: chatId,
-              text: formatPack(idx, cache[idx - 1], buildPack(cache[idx - 1])),
+              text: formatPack(idx, cache[idx - 1], pack),
               parse_mode: "HTML",
               disable_web_page_preview: false,
             });
@@ -359,78 +361,115 @@ function keyboardFor(n) {
   return { inline_keyboard: kb };
 }
 
-function buildPack(item) {
+async function fetchYoutubeVideos(topic, limit = 7) {
+  // Best-effort REAL video URLs for exact topic. 4s cap so packs stay <5s.
+  try {
+    const q = encodeURIComponent(String(topic || "").slice(0, 60));
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch(`https://www.youtube.com/results?search_query=${q}`, {
+      signal: ctrl.signal,
+    }).catch(() => null);
+    clearTimeout(t);
+    if (!r || !r.ok) return [];
+    const html = await r.text();
+    const ids = [...html.matchAll(/"videoId":"([A-Za-z0-9_-]{11})"/g)].map((m) => m[1]);
+    const seen = new Set();
+    const out = [];
+    for (const vid of ids) {
+      if (seen.has(vid)) continue;
+      seen.add(vid);
+      out.push({
+        title: `Real video ${out.length + 1} for: ${String(topic || "").slice(0, 45)}`,
+        url: `https://www.youtube.com/watch?v=${vid}`,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } catch (e) {
+    return [];
+  }
+}
+
+function hookOptions(topic, page) {
+  const short = String(topic || "").slice(0, 45);
+  if (page === "business")
+    return [`STOP. ${short} JUST HAPPENED`, `Nobody saw ${short} coming`, `POV: ${short}`];
+  if (page === "entertainment")
+    return [`WAIT FOR IT. ${short}`, `You missed ${short} 😱`, `POV: ${short} LIVE`];
+  return [String(topic || "").slice(0, 60), `${String(topic || "").slice(0, 50)} — real or hype?`, `POV: ${String(topic || "").slice(0, 50)}`];
+}
+
+function platformPacks(item, topic, hook, handle, summary) {
+  const src = item.source || "";
+  const link = item.link || "";
+  const credit = `Via ${src}`;
+  const page = item.page || "ai";
+  const base =
+    page === "business" ? "#startup #business #founder"
+    : page === "entertainment" ? "#viral #entertainment #trending"
+    : "#ai #ainews #tech";
+  const title60 = String(topic || "").slice(0, 60);
+  return {
+    instagram: { title: title60, caption: `${hook}\n${summary.slice(0, 100)}\nFollow ${handle} daily\n${credit}`, tags: `${base} #reels #reelsindia #explore #fyp #daily`, credit: `${credit} ${link}` },
+    facebook: { title: title60, caption: `${hook}\n${summary.slice(0, 120)}\nFollow for daily drops. ${credit}`, tags: `${base} #reels #facebookreels`, credit: `${credit} ${link}` },
+    tiktok: { title: title60.slice(0, 50), caption: `${hook} ${summary.slice(0, 80)}`, tags: `${base} #fyp #foryou #viral`, credit: `${credit} ${link}` },
+    youtube: { title: title60, caption: `${hook}\n${summary.slice(0, 120)}\nSource: ${link}\nFollow for daily shorts.`, tags: `${base.replace(/#/g, "").replace(/ /g, ", ")}, shorts, viral`, credit: `${credit} ${link}` },
+    x: { title: title60, caption: `${hook}\n${title60}\n${link}`, tags: `${base} #news`, credit: `${credit} ${link}` },
+  };
+}
+
+async function buildPack(item) {
   const topic = shortTopic(item.title);
   const page = item.page || "ai";
   const handle = HANDLES[page] || "";
   const q = encodeURIComponent(topic.slice(0, 60));
+  const gq = encodeURIComponent(topic.slice(0, 60));
   const titles = [`${topic.slice(0, 55)}`, `POV: ${topic.slice(0, 50)}`, `${topic.slice(0, 40)} in 25 seconds`];
-  let overlay = topic.replace(/[^A-Za-z0-9 ]/g, "").trim().toUpperCase().split(/\s+/);
+  const hooks = hookOptions(topic, page);
+  const hook = hooks[0];
+  let overlay = hook.replace(/[^A-Za-z0-9 ]/g, "").trim().toUpperCase().split(/\s+/);
   overlay = overlay.slice(0, 7).join(" ") || topic.slice(0, 30).toUpperCase();
-  let hook, hashtags, script, cta, caption;
+  const summary = clean(item.summary, 180);
+  let hashtags, script;
   if (page === "business") {
-    hook = `STOP. ${topic.slice(0, 45)} just happened.`;
     hashtags = "#startup #business #founder #launch #money";
     script = "0-1s hook above -> 1-8s what launched + proof screenshot -> 8-20s why it prints money -> 20-25s CTA follow for Day 2";
-    cta = "Follow for startup launches daily";
-    caption = `${titles[0]}\n\n${clean(item.summary, 150)}\n\n${cta} ${handle}`;
   } else if (page === "entertainment") {
-    hook = `WAIT FOR IT. ${topic.slice(0, 45)}`;
     hashtags = "#viral #funny #caught #live #drama";
     script = "0-1s WAIT freeze-frame -> 1-6s buildup -> 6-20s payoff x2 replay zoom -> 20-25s comment bait";
-    cta = "Follow for daily viral drops";
-    caption = `${titles[0]}\n\n${clean(item.summary, 140)}\n\n${cta} ${handle}`;
   } else {
-    hook = topic.slice(0, 60);
     hashtags = "#ai #ainews #aiupdates";
     script = "0-1s overlay text only (no voice hype) -> 1-8s screen-record demo -> 8-18s before/after proof -> 18-25s question bait on screen + CTA";
-    const summary = clean(item.summary, 180);
-    let qbait = "What do you think — hype or real shift? 💬";
-    const lowT = topic.toLowerCase();
-    if (lowT.includes("robot")) qbait = "Would you trust a robot to do this better than a human? 🤔💬";
-    else if (lowT.includes("price") || lowT.includes("market") || lowT.includes("billion") || lowT.includes("million"))
-      qbait = "Growing AI future or bubble waiting to burst? 🤔💬";
-    else if (lowT.includes("space") || lowT.includes("science"))
-      qbait = "Are we just scratching the surface of AI's potential? 🚀💬";
-    cta = `Follow for more ${handle} 🔌 Source: ${item.source || ""}`;
-    caption = `${titles[0]}\n\n${summary}\n\n${qbait}\n${cta}\n${hashtags}`;
   }
-  let rohanNote, reshabNote;
-  if (page === "ai") {
-    rohanNote =
-      `CapCut ${PAGE_NAMES[page]} template 1080x1920, captions ON. ` +
-      `Slide1/carousel cover text (bold white, 5-7 words): ${overlay}. ` +
-      `Reel: screen-record demo, subtitles, no hype voice. File: DATE_PAGE_FORMAT_01.`;
-    reshabNote =
-      "Cover = overlay text above. Caption = title + explainer + question + Follow + Source. " +
-      "First comment = same question bait. Reply first 15 in 30 min. Tags: #ai #ainews #aiupdates.";
-  } else if (page === "entertainment") {
-    rohanNote =
-      `CapCut ${PAGE_NAMES[page]} template, <28s 1080x1920. BBC-style if world news: clean photo, ` +
-      `minimal text, subtitles only. If viral: freeze-frame + zoom x2. Cover: ${overlay}.`;
-    reshabNote = "BBC-style: 1-sentence fact + #location #bbcnews style tags. Viral-style: WAIT + comment bait.";
-  } else {
-    rohanNote =
-      `CapCut ${PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, ` +
-      `progress bar, hook 0-1s: ${hook.slice(0, 60)}. File: DATE_PAGE_FORMAT_01.`;
-    reshabNote =
-      "Post via phone apps, cover = hook text, first comment = question bait. " +
-      "Reply first 15 comments in 30 min.";
-  }
+  const realVideos = await fetchYoutubeVideos(topic);
   return {
-    titles, hook, script, caption,
+    titles, hooks, hook, script,
+    caption: `${titles[0]}\n\n${summary}`,
     image_text: overlay,
     hashtags,
     videos: {
       "YouTube search": `https://www.youtube.com/results?search_query=${q}`,
       "TikTok search": `https://www.tiktok.com/search?q=${q}`,
-      "Pexels stock": `https://www.pexels.com/search/${q}/`,
-      "Google News": `https://news.google.com/search?q=${q}`,
+      "Google News": `https://news.google.com/search?q=${gq}`,
     },
+    real_videos: realVideos,
+    image_links: {
+      "Google Images": `https://www.google.com/search?tbm=isch&q=${gq}`,
+      "Unsplash": `https://unsplash.com/s/photos/${q}`,
+      "Pexels": `https://www.pexels.com/search/${q}/`,
+    },
+    platforms: platformPacks(item, topic, hook, handle, summary),
     expiry: "4-6 hrs (entertainment) / 24h (biz/AI). If expired, skip.",
-    rohan_edit: rohanNote,
-    reshab_post: reshabNote,
+    rohan_edit:
+      page === "ai"
+        ? `CapCut ${PAGE_NAMES[page]} template 1080x1920, captions ON. On-screen hook (bold white, 5-7 words): ${overlay}. Reel: screen-record demo, subtitles, no hype voice. File: DATE_PAGE_FORMAT_01.`
+        : page === "entertainment"
+          ? `CapCut ${PAGE_NAMES[page]} template, <28s 1080x1920. BBC-style if world news: clean photo, minimal text, subtitles only. If viral: freeze-frame + zoom x2. Cover: ${overlay}.`
+          : `CapCut ${PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, progress bar, hook 0-1s: ${hook.slice(0, 60)}. File: DATE_PAGE_FORMAT_01.`,
+    reshab_post: "See per-platform section below.",
     credit: `Source: ${item.source} ${item.link} — add 'via ${item.source}' + transformative edit (<30s) to avoid bans.`,
+    director_brief: summary,
   };
 }
 
@@ -441,21 +480,36 @@ function formatPack(idx, item, pack) {
     `${esc(fmtAge(item))} — when it went public`,
     `📰 ${esc(item.source)} — <a href="${esc(item.link)}">source</a>`,
     "",
-    "<b>Titles (pick 1):</b>",
+    "<b>👁 FOR YOU (context):</b>",
+    esc((pack.director_brief || "").slice(0, 220)),
+    `⭐${item.score ?? 0} | ⏳ ${esc(pack.expiry || "")}`,
+    "",
+    "<b>🎬 ROHAN (edit):</b>",
+    `On-screen hook: <b>${esc(pack.hook || "")}</b>`,
+    `Alt: ${esc(((pack.hooks || []).slice(1, 3)).join(" / "))}`,
+    esc((pack.rohan_edit || "").slice(0, 220)),
   ];
-  for (const t of pack.titles) L.push(`• ${esc(t)}`);
-  L.push(`\n<b>Hook 0-1s:</b> ${esc(pack.hook)}`);
-  L.push(`<b>Image text (cover/slide1):</b> ${esc(pack.image_text || "")}`);
-  L.push(`<b>Script 25s:</b> ${esc(pack.script)}`);
-  L.push("\n<b>Caption:</b>");
-  L.push(`<pre>${esc(String(pack.caption || "").slice(0, 300))}</pre>`);
-  L.push(`<b>Hashtags:</b> ${esc(pack.hashtags)}`);
-  L.push("\n<b>Videos (Rohan pulls from here):</b>");
-  for (const [k, v] of Object.entries(pack.videos)) L.push(`• <a href="${esc(v)}">${esc(k)}</a>`);
+  const rv = pack.real_videos || [];
+  if (rv.length) {
+    L.push(`<b>Real videos (top ${Math.min(rv.length, 7)} for exact topic — pick most on-topic):</b>`);
+    rv.slice(0, 7).forEach((v, i) => L.push(`${i + 1}. <a href="${esc(v.url)}">${esc((v.title || "video").slice(0, 45))}</a>`));
+  } else {
+    L.push("<b>No direct video match — images / search:</b>");
+    for (const [k, v] of Object.entries(pack.image_links || {})) L.push(`• <a href="${esc(v)}">${esc(k)}</a>`);
+  }
+  for (const [k, v] of Object.entries(pack.videos || {})) L.push(`• <a href="${esc(v)}">${esc(k)}</a>`);
+  L.push(`Credit: ${esc((pack.credit || "").slice(0, 160))}`);
   L.push("");
-  L.push(`<b>Rohan (edit):</b> ${esc(pack.rohan_edit)}`);
-  L.push(`<b>Reshab (post):</b> ${esc(pack.reshab_post)}`);
-  L.push(`<b>Credit/safety:</b> ${esc(pack.credit)}`);
-  L.push(`<i>⏳ ${esc(pack.expiry)}</i>`);
-  return L.join("\n").slice(0, 3800);
+  L.push("<b>📲 RESHAB (post per platform):</b>");
+  for (const pname of ["instagram", "facebook", "tiktok", "youtube", "x"]) {
+    const p = (pack.platforms || {})[pname];
+    if (!p) continue;
+    L.push(`<b>${pname.toUpperCase()}:</b> ${esc((p.title || "").slice(0, 60))}`);
+    L.push(`${esc((p.caption || "").slice(0, 140))}`);
+    L.push(`${esc((p.tags || "").slice(0, 120))}`);
+    L.push(`<i>${esc((p.credit || "").slice(0, 120))}</i>`);
+  }
+  const text = L.join("\n");
+  if (text.length > 3800) return text.slice(0, 3800).rsplit("\n", 1)[0];
+  return text;
 }

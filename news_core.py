@@ -503,82 +503,158 @@ def short_topic(title):
     return re.sub(r"\s+", " ", t)[:90]
 
 
-def build_pack(item):
+def fetch_youtube_videos(topic, limit=7, timeout=8):
+    """Best-effort real video URLs for the EXACT topic ($0, no key).
+    Scrapes YouTube search HTML for top videoIds. Never raises, never hangs.
+    Returns [{'title':..., 'url':...}]. Empty = use search-link fallback."""
+    import re as _re
+    q = quote_plus((topic or "")[:60])
+    try:
+        r = requests.get(f"https://www.youtube.com/results?search_query={q}",
+                         timeout=timeout, headers=UA)
+        if not r.ok or not r.text:
+            return []
+        ids = _re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', r.text)
+        seen, out = set(), []
+        for vid in ids:
+            if vid in seen:
+                continue
+            seen.add(vid)
+            out.append({"title": f"Real video {len(out)+1} for: {(topic or '')[:45]}",
+                        "url": f"https://www.youtube.com/watch?v={vid}"})
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as ex:
+        print("yt scrape fail", str(ex)[:80])
+        return []
+
+
+def hook_options(topic, page):
+    """3 on-screen hooks, best first — optimized for retention."""
+    short = topic[:45]
+    if page == "business":
+        return [f"STOP. {short} JUST HAPPENED",
+                f"Nobody saw {short} coming",
+                f"POV: {short}"]
+    if page == "entertainment":
+        return [f"WAIT FOR IT. {short}",
+                f"You missed {short} 😱",
+                f"POV: {short} LIVE"]
+    return [topic[:60],
+            f"{topic[:50]} — real or hype?",
+            f"POV: {topic[:50]}"]
+
+
+def platform_packs(item, topic, hook, handle, summary):
+    """Per-platform Title/caption/tags/credit for Reshab. No LLM, template rules."""
+    src = item.get("source", "")
+    link = item.get("link", "")
+    credit = f"Via {src}"
+    page = item.get("page", "ai")
+    base_tags = {
+        "business": "#startup #business #founder",
+        "entertainment": "#viral #entertainment #trending",
+        "ai": "#ai #ainews #tech",
+    }[page] if page in ("business", "entertainment", "ai") else "#news"
+    title60 = topic[:60]
+    return {
+        "instagram": {
+            "title": title60,
+            "caption": f"{hook}\n{summary[:100]}\nFollow {handle} daily\n{credit}",
+            "tags": f"{base_tags} #reels #reelsindia #explore #fyp #daily",
+            "credit": f"{credit} {link}",
+        },
+        "facebook": {
+            "title": title60,
+            "caption": f"{hook}\n{summary[:120]}\nFollow for daily drops. {credit}",
+            "tags": f"{base_tags} #reels #facebookreels",
+            "credit": f"{credit} {link}",
+        },
+        "tiktok": {
+            "title": title60[:50],
+            "caption": f"{hook} {summary[:80]}",
+            "tags": f"{base_tags} #fyp #foryou #viral",
+            "credit": f"{credit} {link}",
+        },
+        "youtube": {
+            "title": title60,
+            "caption": f"{hook}\n{summary[:120]}\nSource: {link}\nFollow for daily shorts.",
+            "tags": f"{base_tags.replace('#','').replace(' ', ', ')}, shorts, viral",
+            "credit": f"{credit} {link}",
+        },
+        "x": {
+            "title": title60,
+            "caption": f"{hook}\n{title60}\n{link}",
+            "tags": f"{base_tags} #news",
+            "credit": f"{credit} {link}",
+        },
+    }
+
+
+def build_pack(item, fetch_videos=True):
     topic = short_topic(item["title"])
     page = item.get("page", "ai")
     handle = HANDLES.get(page, "")
     q = quote_plus(topic[:60])
-    # Style learned from @getintoai (818K), @artificialintelligenceee (911K), @bbcnews
-    # AI pages: plain-sentence title, explainer + question bait + Follow + Source + 3-5 tags
-    # BBC: factual title, 1-sentence fact + location tags + #bbcnews, clean photo, no big text
+    gq = quote_plus(topic[:60])
     titles = [f"{topic[:55]}", f"POV: {topic[:50]}", f"{topic[:40]} in 25 seconds"]
-    # image overlay text: 5-7 words uppercase for slide1 / video cover
-    overlay = re.sub(r"[^A-Za-z0-9 ]", "", topic).strip().upper().split()
+    hooks = hook_options(topic, page)
+    hook = hooks[0]
+    overlay = re.sub(r"[^A-Za-z0-9 ]", "", hook).strip().upper().split()
     overlay = " ".join(overlay[:7]) if overlay else topic[:30].upper()
+    summary = clean(item.get("summary", ""), 180)
     if page == "business":
-        hook = f"STOP. {topic[:45]} just happened."
         hashtags = "#startup #business #founder #launch #money"
         script = ("0-1s hook above -> 1-8s what launched + proof screenshot -> "
                   "8-20s why it prints money -> 20-25s CTA follow for Day 2")
-        cta = "Follow for startup launches daily"
-        caption = (f"{titles[0]}\n\n{clean(item.get('summary', ''), 150)}\n\n{cta} {handle}")
     elif page == "entertainment":
-        hook = f"WAIT FOR IT. {topic[:45]}"
         hashtags = "#viral #funny #caught #live #drama"
         script = ("0-1s WAIT freeze-frame -> 1-6s buildup -> 6-20s payoff x2 "
                   "replay zoom -> 20-25s comment bait")
-        cta = "Follow for daily viral drops"
-        # BBC-style: factual, no hype caps in caption
-        caption = (f"{titles[0]}\n\n{clean(item.get('summary', ''), 140)}\n\n{cta} {handle}")
     else:
-        # getintoai formula: plain title + 2-sentence explainer + question + Follow + Source
-        hook = topic[:60]  # no caps hype, plain like getintoai
         hashtags = "#ai #ainews #aiupdates"
         script = ("0-1s overlay text only (no voice hype) -> 1-8s screen-record demo -> 8-18s "
                   "before/after proof -> 18-25s question bait on screen + CTA")
-        summary = clean(item.get('summary', ''), 180)
-        # question bait like getintoai: "What do you think...?"
-        qbait = "What do you think — hype or real shift? 💬"
-        low_t = topic.lower()
-        if "robot" in low_t:
-            qbait = "Would you trust a robot to do this better than a human? 🤔💬"
-        elif "price" in low_t or "market" in low_t or "billion" in low_t or "million" in low_t:
-            qbait = "Growing AI future or bubble waiting to burst? 🤔💬"
-        elif "space" in low_t or "science" in low_t:
-            qbait = "Are we just scratching the surface of AI's potential? 🚀💬"
-        cta = f"Follow for more {handle} 🔌 Source: {item.get('source','')}"
-        caption = f"{titles[0]}\n\n{summary}\n\n{qbait}\n{cta}\n{hashtags}"
+    # Rohan: 7 REAL video links for the exact topic (scraped), else image fallback
+    real_videos = fetch_youtube_videos(topic) if fetch_videos else []
+    search_links = {
+        "YouTube search": f"https://www.youtube.com/results?search_query={q}",
+        "TikTok search": f"https://www.tiktok.com/search?q={q}",
+        "Google News": f"https://news.google.com/search?q={gq}",
+    }
+    image_links = {
+        "Google Images": f"https://www.google.com/search?tbm=isch&q={gq}",
+        "Unsplash": f"https://unsplash.com/s/photos/{q}",
+        "Pexels": f"https://www.pexels.com/search/{q}/",
+    }
     if page == "ai":
         rohan_note = (f"CapCut {PAGE_NAMES[page]} template 1080x1920, captions ON. "
-                      f"Slide1/carousel cover text (bold white, 5-7 words): {overlay}. "
+                      f"On-screen hook (bold white, 5-7 words): {overlay}. "
                       f"Reel: screen-record demo, subtitles, no hype voice. File: DATE_PAGE_FORMAT_01.")
-        reshab_note = ("Cover = overlay text above. Caption = title + explainer + question + Follow + Source. "
-                       "First comment = same question bait. Reply first 15 in 30 min. Tags: #ai #ainews #aiupdates.")
     elif page == "entertainment":
         rohan_note = (f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920. BBC-style if world news: clean photo, "
                       f"minimal text, subtitles only. If viral: freeze-frame + zoom x2. Cover: {overlay}.")
-        reshab_note = "BBC-style: 1-sentence fact + #location #bbcnews style tags. Viral-style: WAIT + comment bait."
     else:
         rohan_note = (f"CapCut {PAGE_NAMES[page]} template, <28s 1080x1920, captions ON, "
                       f"progress bar, hook 0-1s: {hook[:60]}. File: DATE_PAGE_FORMAT_01.")
-        reshab_note = ("Post via phone apps, cover = hook text, first comment = question bait. "
-                       "Reply first 15 comments in 30 min.")
+    credit = (f"Source: {item['source']} {item['link']} — add 'via {item['source']}' "
+              "+ transformative edit (<30s) to avoid bans.")
+    plats = platform_packs(item, topic, hook, handle, summary)
     return {
-        "titles": titles, "hook": hook, "script": script,
-        "caption": caption,
+        "titles": titles, "hooks": hooks, "hook": hook, "script": script,
+        "caption": f"{titles[0]}\n\n{summary}",
         "image_text": overlay,
         "hashtags": hashtags,
-        "videos": {
-            "YouTube search": f"https://www.youtube.com/results?search_query={q}",
-            "TikTok search": f"https://www.tiktok.com/search?q={q}",
-            "Pexels stock": f"https://www.pexels.com/search/{q}/",
-            "Google News": f"https://news.google.com/search?q={q}",
-        },
+        "videos": search_links,  # compat: search fallbacks
+        "real_videos": real_videos,  # 0-7 real watch URLs, exact-topic top results
+        "image_links": image_links,  # fallback when no video fits
+        "platforms": plats,
         "expiry": "4-6 hrs (entertainment) / 24h (biz/AI). If expired, skip.",
         "rohan_edit": rohan_note,
-        "reshab_post": reshab_note,
-        "credit": (f"Source: {item['source']} {item['link']} — add 'via {item['source']}' "
-                   "+ transformative edit (<30s) to avoid bans."),
+        "reshab_post": "See per-platform section below.",
+        "credit": credit,
+        "director_brief": summary,
     }
 
 
@@ -622,24 +698,40 @@ def format_pack(idx, item, pack):
          f"{fmt_age(item)} — when it went public",
          f"📰 {html.escape(item['source'])} — "
          f"<a href=\"{html.escape(item['link'])}\">source</a>", "",
-         "<b>Titles (pick 1):</b>"]
-    for t in pack["titles"]:
-        L.append(f"• {html.escape(t)}")
-    L.append(f"\n<b>Hook 0-1s:</b> {html.escape(pack['hook'])}")
-    L.append(f"<b>Image text (cover/slide1):</b> {html.escape(pack.get('image_text',''))}")
-    L.append(f"<b>Script 25s:</b> {html.escape(pack['script'])}")
-    L.append("\n<b>Caption:</b>")
-    L.append(f"<pre>{html.escape(pack['caption'][:300])}</pre>")
-    L.append(f"<b>Hashtags:</b> {html.escape(pack['hashtags'])}")
-    L.append("\n<b>Videos (Rohan pulls from here):</b>")
-    for k, v in pack["videos"].items():
+         "<b>👁 FOR YOU (context):</b>",
+         html.escape(pack.get("director_brief", "")[:220]),
+         f"⭐{item.get('score', 0)} | ⏳ {html.escape(pack.get('expiry',''))}", "",
+         "<b>🎬 ROHAN (edit):</b>",
+         f"On-screen hook: <b>{html.escape(pack.get('hook',''))}</b>",
+         f"Alt: {html.escape(' / '.join((pack.get('hooks') or [])[1:3]))}",
+         html.escape(pack.get("rohan_edit", "")[:220])]
+    rv = pack.get("real_videos") or []
+    if rv:
+        L.append(f"<b>Real videos (top {min(len(rv),7)} for exact topic — pick most on-topic):</b>")
+        for i, v in enumerate(rv[:7], 1):
+            L.append(f"{i}. <a href=\"{html.escape(v['url'])}\">{html.escape(v.get('title','video')[:45])}</a>")
+    else:
+        L.append("<b>No direct video match — images / search:</b>")
+        for k, v in (pack.get("image_links") or {}).items():
+            L.append(f"• <a href=\"{html.escape(v)}\">{k}</a>")
+    for k, v in (pack.get("videos") or {}).items():
         L.append(f"• <a href=\"{html.escape(v)}\">{k}</a>")
+    L.append(f"Credit: {html.escape(pack.get('credit','')[:160])}")
     L.append("")
-    L.append(f"<b>Rohan (edit):</b> {html.escape(pack['rohan_edit'])}")
-    L.append(f"<b>Reshab (post):</b> {html.escape(pack['reshab_post'])}")
-    L.append(f"<b>Credit/safety:</b> {html.escape(pack['credit'])}")
-    L.append(f"<i>⏳ {html.escape(pack['expiry'])}</i>")
-    return "\n".join(L)[:3800]
+    L.append("<b>📲 RESHAB (post per platform):</b>")
+    plats = pack.get("platforms") or {}
+    for pname in ("instagram", "facebook", "tiktok", "youtube", "x"):
+        p = plats.get(pname, {})
+        if not p:
+            continue
+        L.append(f"<b>{pname.upper()}:</b> {html.escape(p.get('title','')[:60])}")
+        L.append(f"{html.escape(p.get('caption','')[:140])}")
+        L.append(f"{html.escape(p.get('tags','')[:120])}")
+        L.append(f"<i>{html.escape(p.get('credit','')[:120])}</i>")
+    text = "\n".join(L)
+    if len(text) > 3800:  # cut at line boundary so HTML tags never break
+        text = text[:3800].rsplit("\n", 1)[0]
+    return text
 
 
 def keyboard_for_items(items):
